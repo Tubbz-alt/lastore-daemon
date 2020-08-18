@@ -237,10 +237,16 @@ func (m *Manager) updatePackage(sender dbus.Sender, jobName string, packages str
 
 func (m *Manager) UpdatePackage(sender dbus.Sender, jobName string, packages string) (dbus.ObjectPath,
 	*dbus.Error) {
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return "/", dbusutil.ToError(err)
+	}
 	job, err := m.updatePackage(sender, jobName, packages)
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
+	job.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
@@ -289,6 +295,7 @@ func (m *Manager) InstallPackage(sender dbus.Sender, jobName string, packages st
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
+	job.next.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
@@ -420,6 +427,7 @@ func (m *Manager) RemovePackage(sender dbus.Sender, jobName string, packages str
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
+	job.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
@@ -505,10 +513,16 @@ func (m *Manager) cancelAllJob() error {
 }
 
 func (m *Manager) DistUpgrade(sender dbus.Sender) (dbus.ObjectPath, *dbus.Error) {
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return "/", dbusutil.ToError(err)
+	}
 	job, err := m.distUpgrade(sender)
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
+	job.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
