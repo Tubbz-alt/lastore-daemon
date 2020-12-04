@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
@@ -50,6 +51,13 @@ const (
 	UserExperUninstallApp = "uninstallapp"
 
 	uosReleaseNotePkgName = "uos-release-note"
+)
+
+// 用于设置UpdateMode属性,最大支持64位
+const (
+	SystemUpdate   = 1 << 0 // 系统更新
+	AppStoreUpdate = 1 << 1 // 应用更新
+	SecurityUpdate = 1 << 2 // 安全更新
 )
 
 var (
@@ -95,6 +103,8 @@ type Manager struct {
 
 	apps *apps.Apps
 
+	UpdateMode uint64 `prop:"access:rw"`
+
 	methods *struct { //nolint
 		FixError             func() `in:"errType" out:"job"`
 		CleanArchives        func() `out:"job"`
@@ -136,6 +146,7 @@ func NewManager(service *dbusutil.Service, b system.System, c *Config) *Manager 
 		SystemArchitectures: archs,
 		inhibitFd:           -1,
 		AutoClean:           c.AutoClean,
+		UpdateMode:          c.UpdateMode,
 	}
 	sysBus := service.Conn()
 	m.apps = apps.NewApps(sysBus)
@@ -219,7 +230,13 @@ func (m *Manager) updatePackage(sender dbus.Sender, jobName string, packages str
 		return nil, fmt.Errorf("invalid packages arguments %q : %v", packages, err)
 	}
 
-	m.ensureUpdateSourceOnce()
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return nil, dbusutil.ToError(err)
+	}
+	caller := mapMethodCaller(execPath)
+	m.ensureUpdateSourceOnce(caller)
 	environ, err := makeEnvironWithSender(m.service, sender)
 	if err != nil {
 		return nil, err
@@ -232,21 +249,16 @@ func (m *Manager) updatePackage(sender dbus.Sender, jobName string, packages str
 	if err != nil {
 		_ = log.Warnf("UpdatePackage %q error: %v\n", packages, err)
 	}
+	job.caller = caller
 	return job, err
 }
 
 func (m *Manager) UpdatePackage(sender dbus.Sender, jobName string, packages string) (dbus.ObjectPath,
 	*dbus.Error) {
-	execPath, err := m.getExecutablePath(sender)
-	if err != nil {
-		_ = log.Warn(err)
-		return "/", dbusutil.ToError(err)
-	}
 	job, err := m.updatePackage(sender, jobName, packages)
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
-	job.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
@@ -256,7 +268,12 @@ func (m *Manager) installPackage(sender dbus.Sender, jobName string, packages st
 		return nil, fmt.Errorf("invalid packages arguments %q : %v", packages, err)
 	}
 
-	m.ensureUpdateSourceOnce()
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return nil, dbusutil.ToError(err)
+	}
+	m.ensureUpdateSourceOnce(mapMethodCaller(execPath))
 	environ, err := makeEnvironWithSender(m.service, sender)
 	if err != nil {
 		return nil, err
@@ -434,7 +451,7 @@ func (m *Manager) RemovePackage(sender dbus.Sender, jobName string, packages str
 	return job.getPath(), nil
 }
 
-func (m *Manager) ensureUpdateSourceOnce() {
+func (m *Manager) ensureUpdateSourceOnce(caller methodCaller) {
 	m.do.Lock()
 	updateOnce := m.updateSourceOnce
 	m.do.Unlock()
@@ -443,7 +460,7 @@ func (m *Manager) ensureUpdateSourceOnce() {
 		return
 	}
 
-	_, err := m.updateSource(true)
+	_, err := m.updateSource(true, caller)
 	if err != nil {
 		_ = log.Warn(err)
 	}
@@ -460,7 +477,7 @@ func (m *Manager) handleUpdateInfosChanged() {
 	if m.updater.AutoDownloadUpdates && len(m.updater.UpdatablePackages) > 0 {
 		log.Info("auto download updates")
 		go func() {
-			_, err := m.prepareDistUpgrade()
+			_, err := m.prepareDistUpgrade(methodCallerControlCenter) // 自动下载使用控制中心的配置
 			if err != nil {
 				_ = log.Error("failed to prepare dist-upgrade:", err)
 			}
@@ -468,14 +485,25 @@ func (m *Manager) handleUpdateInfosChanged() {
 	}
 }
 
-func (m *Manager) updateSource(needNotify bool) (*Job, error) {
+func (m *Manager) updateSource(needNotify bool, caller methodCaller) (*Job, error) {
 	m.do.Lock()
 	m.updateSourceOnce = true
 	var jobName string
 	if needNotify {
 		jobName = "+notify"
 	}
-	job, err := m.jobManager.CreateJob(jobName, system.UpdateSourceJobType, nil, nil)
+	var job *Job
+	var err error
+	switch caller {
+	case methodCallerControlCenter:
+		err = m.updateCustomConfig()
+		if err != nil {
+			_ = log.Warn()
+		}
+		job, err = m.jobManager.CreateJob(jobName, system.CustomUpdateJobType, nil, nil)
+	default:
+		job, err = m.jobManager.CreateJob(jobName, system.UpdateSourceJobType, nil, nil)
+	}
 	m.do.Unlock()
 
 	if err != nil {
@@ -484,13 +512,18 @@ func (m *Manager) updateSource(needNotify bool) (*Job, error) {
 
 	job.setHooks(map[string]func(){
 		string(system.SucceedStatus): func() { go m.installUOSReleaseNote() },
-		string(system.EndStatus): m.handleUpdateInfosChanged,
+		string(system.EndStatus):     m.handleUpdateInfosChanged,
 	})
 	return job, err
 }
 
-func (m *Manager) UpdateSource() (dbus.ObjectPath, *dbus.Error) {
-	job, err := m.updateSource(false)
+func (m *Manager) UpdateSource(sender dbus.Sender) (dbus.ObjectPath, *dbus.Error) {
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return "/", dbusutil.ToError(err)
+	}
+	job, err := m.updateSource(false, mapMethodCaller(execPath))
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
@@ -518,21 +551,21 @@ func (m *Manager) cancelAllJob() error {
 }
 
 func (m *Manager) DistUpgrade(sender dbus.Sender) (dbus.ObjectPath, *dbus.Error) {
-	execPath, err := m.getExecutablePath(sender)
-	if err != nil {
-		_ = log.Warn(err)
-		return "/", dbusutil.ToError(err)
-	}
 	job, err := m.distUpgrade(sender)
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
-	job.caller = mapMethodCaller(execPath)
 	return job.getPath(), nil
 }
 
 func (m *Manager) distUpgrade(sender dbus.Sender) (*Job, error) {
-	m.ensureUpdateSourceOnce()
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return nil, dbusutil.ToError(err)
+	}
+	caller := mapMethodCaller(execPath)
+	m.ensureUpdateSourceOnce(caller)
 	environ, err := makeEnvironWithSender(m.service, sender)
 	if err != nil {
 		return nil, err
@@ -549,13 +582,20 @@ func (m *Manager) distUpgrade(sender dbus.Sender) (*Job, error) {
 
 	m.do.Lock()
 	defer m.do.Unlock()
+	if caller == methodCallerControlCenter {
+		_, err = m.updateSource(false, caller)
+		if err != nil {
+			_ = log.Warn(err)
+			return nil, dbusutil.ToError(err)
+		}
+	}
 
 	job, err := m.jobManager.CreateJob("", system.DistUpgradeJobType, upgradableApps, environ)
 	if err != nil {
 		_ = log.Warnf("DistUpgrade error: %v\n", err)
 		return nil, err
 	}
-
+	job.caller = caller
 	cancelErr := m.cancelAllJob()
 	if cancelErr != nil {
 		_ = log.Warn(cancelErr)
@@ -564,16 +604,21 @@ func (m *Manager) distUpgrade(sender dbus.Sender) (*Job, error) {
 	return job, err
 }
 
-func (m *Manager) PrepareDistUpgrade() (dbus.ObjectPath, *dbus.Error) {
-	job, err := m.prepareDistUpgrade()
+func (m *Manager) PrepareDistUpgrade(sender dbus.Sender) (dbus.ObjectPath, *dbus.Error) {
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return "/", dbusutil.ToError(err)
+	}
+	job, err := m.prepareDistUpgrade(mapMethodCaller(execPath))
 	if err != nil {
 		return "/", dbusutil.ToError(err)
 	}
 	return job.getPath(), nil
 }
 
-func (m *Manager) prepareDistUpgrade() (*Job, error) {
-	m.ensureUpdateSourceOnce()
+func (m *Manager) prepareDistUpgrade(caller methodCaller) (*Job, error) {
+	m.ensureUpdateSourceOnce(caller)
 	m.updateJobList()
 
 	m.PropsMu.RLock()
@@ -631,8 +676,13 @@ func (m *Manager) CleanJob(jobId string) *dbus.Error {
 	return dbusutil.ToError(err)
 }
 
-func (m *Manager) PackagesDownloadSize(packages []string) (int64, *dbus.Error) {
-	m.ensureUpdateSourceOnce()
+func (m *Manager) PackagesDownloadSize(sender dbus.Sender, packages []string) (int64, *dbus.Error) {
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return 0, dbusutil.ToError(err)
+	}
+	m.ensureUpdateSourceOnce(mapMethodCaller(execPath))
 
 	s, err := system.QueryPackageDownloadSize(packages...)
 	if err != nil || s == system.SizeUnknown {
@@ -818,7 +868,12 @@ func (m *Manager) FixError(sender dbus.Sender, errType string) (dbus.ObjectPath,
 }
 
 func (m *Manager) fixError(sender dbus.Sender, errType string) (*Job, error) {
-	m.ensureUpdateSourceOnce()
+	execPath, err := m.getExecutablePath(sender)
+	if err != nil {
+		_ = log.Warn(err)
+		return nil, dbusutil.ToError(err)
+	}
+	m.ensureUpdateSourceOnce(mapMethodCaller(execPath))
 	environ, err := makeEnvironWithSender(m.service, sender)
 	if err != nil {
 		return nil, err
@@ -865,4 +920,38 @@ func (m *Manager) installUOSReleaseNote() {
 			}
 		}
 	}
+}
+
+func (m *Manager) updateCustomConfig() error {
+	const (
+		confPath = "/etc/apt/apt.conf.d/99custom.conf"
+		header   = "Acquire::SmartMirrors::SourceList:: "
+		footer   = ";"
+		comment  = "# This file was automatically generated from lastore-daemon - DO NOT EDIT!"
+	)
+	m.PropsMu.RLock()
+	mode := m.UpdateMode
+	m.PropsMu.RUnlock()
+	var content []string
+	content = append(content, comment)
+	if mode&SystemUpdate == SystemUpdate {
+		content = append(content, header+"sources.list"+footer)
+	}
+	if mode&AppStoreUpdate == AppStoreUpdate {
+		content = append(content, header+"appstore.list"+footer)
+	}
+	if mode&SecurityUpdate == SecurityUpdate {
+		content = append(content, header+"safe.list"+footer)
+	}
+	resContent := strings.Join(content, "\n")
+	return ioutil.WriteFile(confPath, []byte(resContent), 0644)
+}
+
+func (m *Manager) updateModeWriteCallback(pw *dbusutil.PropertyWrite) *dbus.Error {
+	mode := pw.Value.(uint64)
+	if mode&AppStoreUpdate == AppStoreUpdate { // 如果更新模式包含应用商店的更新,则强制设置系统更新的配置
+		mode |= SystemUpdate
+		pw.Value = mode
+	}
+	return dbusutil.ToError(m.config.SetUpdateMode(mode))
 }
